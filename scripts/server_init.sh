@@ -43,9 +43,6 @@ source .venv/bin/activate
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
 
-echo "--- Installing Playwright Chromium"
-python3 -m playwright install chromium 2>&1 | tail -5
-
 echo "--- Creating .env if missing"
 if [[ ! -f .env ]]; then
   cp .env.example .env

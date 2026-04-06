@@ -9,7 +9,6 @@ cd "$PROJECT_DIR"
 git pull --ff-only
 source .venv/bin/activate
 pip install -r requirements.txt -q
-python -m playwright install chromium 2>&1 | tail -5
 systemctl --user daemon-reload
 systemctl --user restart ev-collector
 systemctl --user status ev-collector --no-pager

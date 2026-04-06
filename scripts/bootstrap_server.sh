@@ -16,7 +16,6 @@ fi
 source .venv/bin/activate
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
-python -m playwright install chromium
 
 mkdir -p logs
 
