@@ -1,13 +1,11 @@
 <#
 .SYNOPSIS
-    One-time setup: configure SSH key auth on CEZ083 and push the collector.
+    One-time setup: push the collector to CEZ083 using existing SSH key auth.
 .DESCRIPTION
     Reads connection details from deploy.conf (gitignored).
     Run from the repo root:  powershell -ExecutionPolicy Bypass -File scripts\setup_git_remote.ps1
-.PARAMETER SkipKeySetup
-    Skip SSH key generation and copy (use if keys are already installed).
 #>
-param([switch]$SkipKeySetup)
+param()
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -39,45 +37,55 @@ if (-not ($sshHost -and $sshPort -and $sshUser -and $barerepo)) {
 
 $sshTarget = "${sshUser}@${sshHost}"
 $gitRemote = "ssh://${sshUser}@${sshHost}:${sshPort}${barerepo}"
+$sshBatchArgs = @("-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=8", "-p", $sshPort)
+$sshInteractiveArgs = @("-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=8", "-p", $sshPort)
+$sshArgs = $sshBatchArgs
 
 # ---------------------------------------------------------------------------
-# Step 1: SSH key setup (one-time password prompt)
+# Step 1: SSH authentication preflight
 # ---------------------------------------------------------------------------
-if (-not $SkipKeySetup) {
-    Write-Host "`n[Step 1] SSH key setup"
-    $keyFile = "$HOME\.ssh\id_ed25519"
-    if (-not (Test-Path "$keyFile.pub")) {
-        Write-Host "  Generating ed25519 key pair..."
-        New-Item -ItemType Directory -Force -Path "$HOME\.ssh" | Out-Null
-        # Feed two newlines to accept empty passphrase and confirmation.
-        "`n`n" | ssh-keygen -t ed25519 -f "$keyFile"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "ssh-keygen failed with exit code $LASTEXITCODE"
-            exit 1
-        }
-    } else {
-        Write-Host "  Key already exists: $keyFile.pub"
-    }
-    if (-not (Test-Path "$keyFile.pub")) {
-        Write-Error "SSH key generation failed. Public key not found at $keyFile.pub"
-        exit 1
-    }
-    $pubKey = (Get-Content "$keyFile.pub" -Raw).Trim()
-    $pubKey = $pubKey -replace "'", ""   # strip any stray quotes for safety
-    Write-Host "  Copying public key to server (you will be prompted for the server password once)..."
-    ssh -p $sshPort -o StrictHostKeyChecking=accept-new $sshTarget `
-        "mkdir -p ~/.ssh && printf '%s\n' '$pubKey' >> ~/.ssh/authorized_keys && sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
-    Write-Host "  SSH key installed. Future connections will be passwordless."
+Write-Host "`n[Step 1] Verifying SSH authentication..."
+$prevErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& ssh @sshBatchArgs $sshTarget "exit" *> $null 2>$null
+$sshProbeExitCode = $LASTEXITCODE
+$ErrorActionPreference = $prevErrorActionPreference
+if ($sshProbeExitCode -eq 0) {
+        Write-Host "  Non-interactive SSH auth OK."
+        $sshArgs = $sshBatchArgs
 } else {
-    Write-Host "`n[Step 1] SSH key setup skipped (--SkipKeySetup)"
+        Write-Host "  Non-interactive SSH auth unavailable. Falling back to interactive SSH prompts."
+        $sshArgs = $sshInteractiveArgs
 }
 
 # ---------------------------------------------------------------------------
 # Step 2: Initialise server (bare repo + hook + linger)
 # ---------------------------------------------------------------------------
 Write-Host "`n[Step 2] Initialising server bare repo and hook..."
-$serverInitScript = Get-Content (Join-Path $PSScriptRoot "server_init.sh") -Raw
-$serverInitScript | ssh -p $sshPort -o StrictHostKeyChecking=accept-new $sshTarget "bash -s"
+# Write with guaranteed LF endings via .NET, then scp to avoid PowerShell pipe CRLF issues.
+$serverInitScript = (Get-Content (Join-Path $PSScriptRoot "server_init.sh") -Raw) -replace "`r`n","`n" -replace "`r","`n"
+$tmpInit = [System.IO.Path]::GetTempFileName() + ".sh"
+[System.IO.File]::WriteAllBytes($tmpInit, [System.Text.Encoding]::UTF8.GetBytes($serverInitScript))
+$scpArgs = @("-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=8", "-P", $sshPort)
+$prevErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& scp @scpArgs $tmpInit "${sshTarget}:/tmp/hkust_server_init_$PID.sh"
+$scpExitCode = $LASTEXITCODE
+$ErrorActionPreference = $prevErrorActionPreference
+Remove-Item $tmpInit -Force -ErrorAction SilentlyContinue
+if ($scpExitCode -ne 0) {
+    Write-Error "scp of server_init.sh failed with exit code $scpExitCode"
+    exit 1
+}
+$prevErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& ssh @sshArgs $sshTarget "bash /tmp/hkust_server_init_$PID.sh; rm -f /tmp/hkust_server_init_$PID.sh"
+$sshInitExitCode = $LASTEXITCODE
+$ErrorActionPreference = $prevErrorActionPreference
+if ($sshInitExitCode -ne 0) {
+    Write-Error "Server initialization failed with exit code $sshInitExitCode"
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # Step 3: Add / update git remote
