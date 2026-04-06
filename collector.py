@@ -12,7 +12,7 @@ from typing import Any
 
 import aiohttp
 from dotenv import load_dotenv
-from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+
 
 UTC = timezone.utc
 
@@ -78,23 +78,11 @@ class Config:
     log_file: str
     sessions_csv: str
     live_csv: str
-    portal_login_url: str
+    portal_api_base: str
     portal_username: str
     portal_password: str
-    playwright_headless: bool
-    playwright_profile_dir: str
-    discovery_log_keys: bool
-    current_keys: list[str]
-    voltage_keys: list[str]
-    power_keys: list[str]
-    energy_keys: list[str]
-    soc_keys: list[str]
-    status_keys: list[str]
     charger_id_keys: list[str]
     connector_id_keys: list[str]
-    username_selectors: list[str]
-    password_selectors: list[str]
-    submit_selectors: list[str]
 
     @staticmethod
     def from_env() -> "Config":
@@ -122,23 +110,11 @@ class Config:
             log_file=os.getenv("LOG_FILE", "logs/collector.log"),
             sessions_csv="charging_sessions.csv",
             live_csv="charging_live.csv",
-            portal_login_url="https://ust-ev.cstl.com.hk/portal/cps",
+            portal_api_base="https://ust-ev.cstl.com.hk/portal/api/api",
             portal_username=secrets["PORTAL_USERNAME"],
             portal_password=secrets["PORTAL_PASSWORD"],
-            playwright_headless=parse_bool(os.getenv("PLAYWRIGHT_HEADLESS"), True),
-            playwright_profile_dir=".playwright-profile",
-            discovery_log_keys=True,
-            current_keys=["current", "currenta", "chargingcurrent", "amp", "amps", "outputcurrent"],
-            voltage_keys=["voltage", "voltagev", "volt", "outputvoltage"],
-            power_keys=["power", "powerkw", "kw", "outputpower", "chargingpower"],
-            energy_keys=["energy", "energykwh", "kwh", "deliveredenergy", "chargedenergy"],
-            soc_keys=["soc", "stateofcharge", "batterypercent", "batterypercentage"],
-            status_keys=["status", "chargerstatus", "connectorstatus", "state", "chargingstatus"],
             charger_id_keys=["chargerid", "charger_id", "chargerno", "chargercode", "chargepointid", "cpid", "name", "id"],
             connector_id_keys=["connectorid", "connector_id", "connectorno", "connector"],
-            username_selectors=["input[type='email']", "input[name='username']", "input[id*='user']"],
-            password_selectors=["input[type='password']", "input[name='password']", "input[id*='pass']"],
-            submit_selectors=["button[type='submit']", "button:has-text('Login')", "button:has-text('Sign in')"],
         )
 
 
@@ -327,200 +303,59 @@ class SessionTracker:
         return None
 
 
-class PlaywrightTelemetryCollector:
-    def __init__(self, config: Config, logger: logging.Logger):
+class PortalApiCollector:
+    """Polls the portal REST API directly for live connector telemetry."""
+
+    _AUTH_PATH = "/authenticate"
+    _QUICKINFO_PATH = "/v2/quickInfo"
+    _TOKEN_LIFETIME_SECONDS = 2700  # 45 minutes
+
+    def __init__(self, config: Config, http: aiohttp.ClientSession, logger: logging.Logger):
         self.config = config
+        self.http = http
         self.logger = logger
-        self._playwright: Playwright | None = None
-        self._context: BrowserContext | None = None
-        self._page: Page | None = None
-        self._latest: dict[tuple[str, str], dict[str, Any]] = {}
-        self._last_login: datetime | None = None
+        self._token: str | None = None
+        self._token_expires_at: datetime = datetime.now(tz=UTC)
 
-    async def start(self) -> None:
-        profile_dir = Path(self.config.playwright_profile_dir)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        self._playwright = await async_playwright().start()
-        self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir.resolve()),
-            headless=self.config.playwright_headless,
-            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"],
-        )
-        self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-        self._page.on("response", self._on_response)
-        await self._ensure_login(force=True)
+    async def _ensure_token(self) -> str:
+        if self._token and datetime.now(tz=UTC) < self._token_expires_at:
+            return self._token
+        return await self._authenticate()
 
-    async def stop(self) -> None:
-        if self._context:
-            await self._context.close()
-            self._context = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-
-    async def _find_first_selector(self, selectors: list[str]) -> str | None:
-        if not self._page:
-            return None
-        for selector in selectors:
-            locator = self._page.locator(selector)
+    async def _authenticate(self) -> str:
+        url = f"{self.config.portal_api_base}{self._AUTH_PATH}"
+        body = {"username": self.config.portal_username, "password": self.config.portal_password}
+        for attempt in range(1, 4):
             try:
-                count = await locator.count()
-                if count > 0:
-                    return selector
-            except Exception:
-                continue
-        return None
+                async with self.http.post(url, json=body) as resp:
+                    payload = await resp.json(content_type=None)
+                    if resp.status >= 400:
+                        raise RuntimeError(f"Portal auth returned HTTP {resp.status}")
+                token_raw = (payload.get("response") or {}).get("token") or ""
+                token = token_raw.removeprefix("Bearer ").strip()
+                if not token:
+                    raise RuntimeError("Empty or missing token in portal auth response")
+                self._token = token
+                self._token_expires_at = datetime.now(tz=UTC) + timedelta(seconds=self._TOKEN_LIFETIME_SECONDS)
+                self.logger.info("Portal token refreshed")
+                return token
+            except Exception as exc:
+                self.logger.warning("Portal auth attempt %s failed: %s", attempt, exc)
+                if attempt < 3:
+                    await asyncio.sleep(min(2 ** attempt, 10))
+        raise RuntimeError("Portal authentication failed after retries")
 
-    async def _ensure_login(self, force: bool = False) -> None:
-        if not self._page:
-            raise RuntimeError("Playwright page is not initialized")
+    async def fetch_quickinfo(self) -> dict[str, Any]:
+        token = await self._ensure_token()
+        url = f"{self.config.portal_api_base}{self._QUICKINFO_PATH}"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        async with self.http.get(url, headers=headers) as resp:
+            payload = await resp.json(content_type=None)
+            if resp.status >= 400:
+                self._token = None  # force re-auth on next call
+                raise RuntimeError(f"quickInfo returned HTTP {resp.status}")
+            return payload
 
-        stale = not self._last_login or (datetime.now(tz=UTC) - self._last_login) > timedelta(minutes=20)
-        if not force and not stale:
-            return
-
-        await self._page.goto(self.config.portal_login_url, wait_until="domcontentloaded", timeout=30000)
-        await self._page.wait_for_timeout(1000)
-
-        username_selector = await self._find_first_selector(self.config.username_selectors)
-        password_selector = await self._find_first_selector(self.config.password_selectors)
-
-        if username_selector and password_selector:
-            await self._page.fill(username_selector, self.config.portal_username)
-            await self._page.fill(password_selector, self.config.portal_password)
-            submit_selector = await self._find_first_selector(self.config.submit_selectors)
-            if submit_selector:
-                await self._page.click(submit_selector)
-            else:
-                await self._page.keyboard.press("Enter")
-            await self._page.wait_for_timeout(2500)
-
-        self._last_login = datetime.now(tz=UTC)
-        self.logger.info("Playwright login cycle completed")
-
-    async def cycle(self) -> list[dict[str, Any]]:
-        if not self._page:
-            raise RuntimeError("Playwright is not initialized")
-        await self._ensure_login(force=False)
-        await self._page.goto(self.config.portal_login_url, wait_until="networkidle", timeout=30000)
-        await self._page.wait_for_timeout(1200)
-
-        snapshot = list(self._latest.values())
-        self._latest.clear()
-        return snapshot
-
-    async def _on_response(self, response) -> None:
-        try:
-            request = response.request
-            if request.resource_type not in {"xhr", "fetch"}:
-                return
-
-            headers = response.headers
-            content_type = headers.get("content-type", "")
-            if "json" not in content_type.lower():
-                return
-
-            payload = await response.json()
-            url = response.url
-
-            if self.config.discovery_log_keys:
-                keys = self._top_keys(payload)
-                self.logger.info("Telemetry candidate url=%s keys=%s", url, keys)
-
-            records = self._extract_telemetry_records(payload, source_endpoint=url)
-            for record in records:
-                key = (record["charger_id"], record["connector_id"])
-                self._latest[key] = record
-        except Exception as exc:
-            self.logger.warning("Response interception failed: %s", exc)
-
-    @staticmethod
-    def _top_keys(payload: Any) -> list[str]:
-        if isinstance(payload, dict):
-            return list(payload.keys())[:20]
-        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-            return list(payload[0].keys())[:20]
-        return []
-
-    def _extract_telemetry_records(self, payload: Any, source_endpoint: str) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-
-        def walk(node: Any) -> None:
-            if isinstance(node, dict):
-                current = self._pick_number(node, self.config.current_keys)
-                voltage = self._pick_number(node, self.config.voltage_keys)
-                power = self._pick_number(node, self.config.power_keys)
-                energy = self._pick_number(node, self.config.energy_keys)
-                soc = self._pick_number(node, self.config.soc_keys)
-                status = self._pick_text(node, self.config.status_keys)
-                if current is not None or voltage is not None or power is not None or energy is not None or soc is not None:
-                    charger_id = self._pick_identifier(node, self.config.charger_id_keys)
-                    connector_id = self._pick_identifier(node, self.config.connector_id_keys) or charger_id
-                    if charger_id:
-                        power_est = None
-                        if current is not None and voltage is not None:
-                            power_est = round((current * voltage) / 1000.0, 3)
-                        records.append(
-                            {
-                                "timestamp_utc": now_utc_iso(),
-                                "charger_id": charger_id,
-                                "connector_id": connector_id,
-                                "current_A": "" if current is None else current,
-                                "voltage_V": "" if voltage is None else voltage,
-                                "power_kW": "" if power is None else power,
-                                "power_kW_est": "" if power_est is None else power_est,
-                                "energy_kWh": "" if energy is None else energy,
-                                "soc_pct": "" if soc is None else soc,
-                                "status": "" if status is None else status,
-                                "source_endpoint": source_endpoint,
-                            }
-                        )
-                for value in node.values():
-                    walk(value)
-            elif isinstance(node, list):
-                for item in node:
-                    walk(item)
-
-        walk(payload)
-        return records
-
-    @staticmethod
-    def _normalize_key(key: str) -> str:
-        return "".join(char.lower() for char in key if char.isalnum() or char == "_")
-
-    def _pick_number(self, node: dict[str, Any], candidates: list[str]) -> float | None:
-        normalized = {self._normalize_key(key): value for key, value in node.items()}
-        for candidate in candidates:
-            target = self._normalize_key(candidate)
-            for key, value in normalized.items():
-                if key == target:
-                    try:
-                        return float(value)
-                    except (TypeError, ValueError):
-                        return None
-        return None
-
-    def _pick_identifier(self, node: dict[str, Any], candidates: list[str]) -> str | None:
-        normalized = {self._normalize_key(key): value for key, value in node.items()}
-        for candidate in candidates:
-            target = self._normalize_key(candidate)
-            for key, value in normalized.items():
-                if key == target and value is not None:
-                    text = str(value).strip()
-                    if text:
-                        return text
-        return None
-
-    def _pick_text(self, node: dict[str, Any], candidates: list[str]) -> str | None:
-        normalized = {self._normalize_key(key): value for key, value in node.items()}
-        for candidate in candidates:
-            target = self._normalize_key(candidate)
-            for key, value in normalized.items():
-                if key == target and value is not None:
-                    text = str(value).strip()
-                    if text:
-                        return text
-        return None
 
 
 class CollectorApp:
@@ -529,7 +364,7 @@ class CollectorApp:
         self.run_seconds = run_seconds
         self.logger = setup_logging(config)
         self.stop_event = asyncio.Event()
-        self.telemetry_collector = PlaywrightTelemetryCollector(config, self.logger)
+        self.portal_collector: PortalApiCollector | None = None
         self.session_tracker = SessionTracker()
         self.http: aiohttp.ClientSession | None = None
         self.token_manager: TokenManager | None = None
@@ -585,7 +420,26 @@ class CollectorApp:
                 "energy_kWh",
                 "soc_pct",
                 "status",
+                "tran_start_utc",
+                "tran_stop_utc",
+                "last_update_utc",
+                "loc_id",
                 "source_endpoint",
+            ],
+        )
+        self.dashboard_writer = CsvWriter(
+            "charging_dashboard.csv",
+            [
+                "timestamp_utc",
+                "n_charging",
+                "n_available",
+                "n_unavailable",
+                "yesterday_kwh",
+                "yesterday_duration_s",
+                "today_kwh",
+                "today_duration_s",
+                "last7d_kwh",
+                "last7d_duration_s",
             ],
         )
 
@@ -593,6 +447,7 @@ class CollectorApp:
         timeout = aiohttp.ClientTimeout(total=self.config.http_timeout_seconds)
         self.http = aiohttp.ClientSession(timeout=timeout)
         self.token_manager = TokenManager(self.config, self.http, self.logger)
+        self.portal_collector = PortalApiCollector(self.config, self.http, self.logger)
 
     async def _close_http(self) -> None:
         if self.http:
@@ -674,25 +529,68 @@ class CollectorApp:
 
             await self._wait_next_cycle()
 
-    async def telemetry_loop(self) -> None:
+    async def portal_loop(self) -> None:
+        assert self.portal_collector is not None
         while not self.stop_event.is_set():
+            ts = now_utc_iso()
             try:
-                rows = await self.telemetry_collector.cycle()
-                if rows:
-                    for row in rows:
-                        await self.live_writer.append_row(row)
-                    self.logger.info("Telemetry rows appended=%s", len(rows))
+                data = await self.portal_collector.fetch_quickinfo()
+                connectors = data.get("cpQuickInfoDTOS") or []
+                for entry in connectors:
+                    voltages = entry.get("voltages") or []
+                    currents = entry.get("currents") or []
+                    voltage = voltages[0] if voltages else None
+                    current = currents[0] if currents else None
+                    power = entry.get("kw")
+                    power_est = None
+                    if current is not None and voltage is not None:
+                        power_est = round(current * voltage / 1000.0, 3)
+                    await self.live_writer.append_row(
+                        {
+                            "timestamp_utc": ts,
+                            "charger_id": entry.get("cpNo") or "",
+                            "connector_id": entry.get("connectorId") or "",
+                            "current_A": "" if current is None else current,
+                            "voltage_V": "" if voltage is None else voltage,
+                            "power_kW": "" if power is None else power,
+                            "power_kW_est": "" if power_est is None else power_est,
+                            "energy_kWh": "" if entry.get("kwh") is None else entry.get("kwh"),
+                            "soc_pct": "" if entry.get("soc") is None else entry.get("soc"),
+                            "status": entry.get("connectorStatus") or "",
+                            "tran_start_utc": parse_timestamp(entry.get("tranStartDate")) or "",
+                            "tran_stop_utc": parse_timestamp(entry.get("tranStopDate")) or "",
+                            "last_update_utc": parse_timestamp(entry.get("lastStatusUpdateDate")) or "",
+                            "loc_id": entry.get("locId") if entry.get("locId") is not None else "",
+                            "source_endpoint": "/v2/quickInfo",
+                        }
+                    )
+
+                usage = data.get("cpUsage") or {}
+                summary = data.get("cpSummaryByDayRangeQuickInfoDTO") or {}
+                yesterday = summary.get("yesterdaySummary") or {}
+                today_s = summary.get("todaySummary") or {}
+                last7d = summary.get("last7daysSummary") or {}
+                await self.dashboard_writer.append_row(
+                    {
+                        "timestamp_utc": ts,
+                        "n_charging": usage.get("noOfChargingConnectors") if usage.get("noOfChargingConnectors") is not None else "",
+                        "n_available": usage.get("noOfAvailableConnectors") if usage.get("noOfAvailableConnectors") is not None else "",
+                        "n_unavailable": usage.get("noOfUnAvailableConnectors") if usage.get("noOfUnAvailableConnectors") is not None else "",
+                        "yesterday_kwh": yesterday.get("kwh") if yesterday.get("kwh") is not None else "",
+                        "yesterday_duration_s": yesterday.get("duration") if yesterday.get("duration") is not None else "",
+                        "today_kwh": today_s.get("kwh") if today_s.get("kwh") is not None else "",
+                        "today_duration_s": today_s.get("duration") if today_s.get("duration") is not None else "",
+                        "last7d_kwh": last7d.get("kwh") if last7d.get("kwh") is not None else "",
+                        "last7d_duration_s": last7d.get("duration") if last7d.get("duration") is not None else "",
+                    }
+                )
+                self.logger.info(
+                    "Portal snapshot: connectors=%s charging=%s",
+                    len(connectors),
+                    usage.get("noOfChargingConnectors"),
+                )
             except Exception as exc:
-                self.logger.warning("Playwright cycle failed: %s", exc)
-                try:
-                    await self.telemetry_collector.stop()
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-                try:
-                    await self.telemetry_collector.start()
-                except Exception as restart_exc:
-                    self.logger.warning("Playwright restart failed: %s", restart_exc)
+                self.logger.warning("Portal cycle failed: %s", exc)
 
             await self._wait_next_cycle()
 
@@ -811,7 +709,6 @@ class CollectorApp:
 
     async def start(self) -> None:
         await self._init_http()
-        await self.telemetry_collector.start()
 
         if self.run_seconds and self.run_seconds > 0:
             asyncio.create_task(self._stop_after(self.run_seconds))
@@ -824,16 +721,12 @@ class CollectorApp:
                 signal.signal(signame, lambda *_: self.stop_event.set())
 
         try:
-            await asyncio.gather(self.api_loop(), self.telemetry_loop())
+            await asyncio.gather(self.api_loop(), self.portal_loop())
         finally:
             await self.shutdown()
 
     async def shutdown(self) -> None:
         self.stop_event.set()
-        try:
-            await self.telemetry_collector.stop()
-        except Exception as exc:
-            self.logger.warning("Error stopping Playwright: %s", exc)
         await self._close_http()
         self.logger.info("Collector shutdown complete")
 
