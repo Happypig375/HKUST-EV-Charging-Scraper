@@ -1,89 +1,109 @@
 # HKUST EV Charging Collector
 
-Polls the HKUST EV charging REST API and the portal web interface every 30 seconds,
-writing two append-only CSV files:
+Collects HKUST EV charging data every 30 seconds from two APIs and writes append-only CSV files.
 
-| File | Contents |
-|---|---|
-| `charging_sessions.csv` | Session start/end times per charger |
-| `charging_live.csv` | Live current (A) and voltage (V) captured from portal XHR traffic |
+- Third-party charger API (`/portal/api/thirdparty/v1`): charger and connector status used for session tracking.
+- Portal dashboard API (`/portal/api/api/v2/quickInfo`): live power/voltage/current/energy and fleet-level dashboard metrics.
 
----
+## Current Outputs
+
+| File | Source | Contents |
+|---|---|---|
+| `charging_sessions.csv` | Third-party API | Session transitions (start/end) with charger, connector, tariff, and location metadata |
+| `charging_live.csv` | Portal quickInfo API | Per-connector live snapshot (`kw`, `kwh`, `voltages`, `currents`, `status`, timestamps, locId) |
+| `charging_dashboard.csv` | Portal quickInfo API | Fleet summary counts and energy/duration for yesterday, today, and last 7 days |
+| `collector_state.json` | Local state file | Persisted in-memory session state for restart/crash recovery |
+
+## Architecture
+
+`collector.py` runs two async loops:
+
+1. `api_loop()`
+- Fetches full charger list from third-party API (`/charger`).
+- Derives connector-level records.
+- Tracks transitions using `SessionTracker` and writes session rows.
+
+2. `portal_loop()`
+- Authenticates with portal API (`POST /authenticate`) using `PORTAL_USERNAME`/`PORTAL_PASSWORD`.
+- Polls `GET /v2/quickInfo`.
+- Writes one `charging_live.csv` row per connector and one `charging_dashboard.csv` row per poll.
+
+## Restart/Crash Safety
+
+`SessionTracker` is persisted to disk in `collector_state.json`.
+
+- On startup, state is loaded from disk if present.
+- On every transition update, state is written atomically (`.tmp` then replace).
+- This prevents duplicate session-start rows after service restarts while connectors are still charging.
 
 ## Files
 
 ```
-collector.py              Main async collector (dual-loop: API + Playwright)
+collector.py              Main async collector (dual-loop: third-party API + portal API)
 requirements.txt          Python dependencies
-.env.example              Template — copy to .env and fill in secrets
+.env.example              Template - copy to .env and fill secrets
 restarter.sh              Crash-restart wrapper called by systemd
-ev-collector.service      systemd user-service unit
+ev-collector.service      systemd user service unit
 deploy.conf.example       Server connection template (copy to deploy.conf, gitignored)
 scripts/
-  setup_git_remote.ps1    One-time Windows setup: SSH key + push
+  setup_git_remote.ps1    One-time Windows setup: SSH key + first push
   server_init.sh          One-time server setup: bare repo + post-receive hook
-  bootstrap_server.sh     Manual fallback bootstrap (if not using git push)
-  update_and_restart.sh   Manual update fallback (if not using git push)
+  bootstrap_server.sh     Manual fallback bootstrap
+  update_and_restart.sh   Manual update fallback
 ```
 
----
+## Quick Start
 
-## Quick start
+### 1. Prerequisites (Windows)
 
-### 1 — Prerequisites (Windows machine)
+- Git for Windows, Python, OpenSSH client (`ssh`, `ssh-keygen`) on `PATH`.
+- Optional local test setup:
 
-- Git for Windows, Python 3.12, OpenSSH client (`ssh`, `ssh-keygen`) all on `PATH`.
-- Install Python deps locally if you want to test before pushing:
-  ```powershell
-  python -m venv .venv
-  .venv\Scripts\Activate.ps1
-  pip install -r requirements.txt
-  ```
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-### 2 — Create your local credential files
+### 2. Prepare local config files
 
 ```powershell
 # Connection details for CEZ083 (gitignored)
 Copy-Item deploy.conf.example deploy.conf
-# Then open deploy.conf and confirm the values match CEZ083:
-#   SERVER_HOST=143.89.22.207  SERVER_PORT=830  SERVER_USER=user
 
-# Runtime secrets — only these three lines matter
+# Runtime secrets (gitignored)
 Copy-Item .env.example .env
-# Open .env and set:
-#   API_KEY=<thirdparty_api_key>
-#   PORTAL_USERNAME=<portal_username>
-#   PORTAL_PASSWORD=<portal_password>
 ```
 
-> `.env` and `deploy.conf` are both gitignored and will never be committed.
+Fill `.env` with:
 
-### 3 — One-time server setup + first push
+```env
+API_KEY=<thirdparty_api_key>
+PORTAL_USERNAME=<portal_username>
+PORTAL_PASSWORD=<portal_password>
+```
+
+### 3. First-time server setup + push
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\setup_git_remote.ps1
 ```
 
-This script:
-1. Generates an ed25519 SSH key pair on your machine (skips if one exists).
-2. Copies the public key to CEZ083 (one authentication prompt).
-3. Pipes `server_init.sh` to CEZ083 over SSH, which creates a bare git repo,
-   installs the `post-receive` hook, and enables systemd user linger.
-4. Adds `origin` to your local git config and pushes.
+The setup script and post-receive hook will:
 
-The **post-receive hook** runs automatically on every push and:
-- Checks out code to `~/hkust-ev-collector`
-- Installs / updates Python dependencies
-- Installs Playwright Chromium
-- Copies `ev-collector.service` into `~/.config/systemd/user/`
-- Restarts the systemd user service
+- Create/configure remote bare repo.
+- Check out to `~/hkust-ev-collector`.
+- Install/update Python dependencies.
+- Install/update user systemd service.
+- Restart collector service after each push.
 
-After the first push, **edit `.env` on the server once**:
+After first deployment, edit server `.env` once:
+
 ```bash
 ssh -p <server_port> <server_user>@<server_host> "nano ~/hkust-ev-collector/.env"
 ```
 
-### 4 — Subsequent updates
+### 4. Subsequent updates
 
 ```powershell
 git add -A
@@ -91,74 +111,59 @@ git commit -m "your message"
 git push
 ```
 
-That's it. The hook handles deployment and service restart automatically.
-
----
-
-## Service management (on CEZ083)
+## Service Management (CEZ083)
 
 ```bash
-# SSH in
-ssh -p <server_port> <server_user>@<server_host>
-
 # Status
-systemctl --user status ev-collector
+systemctl --user status ev-collector.service
 
 # Logs (live)
-journalctl --user -u ev-collector -f
+journalctl --user -u ev-collector.service -f
 
-# Restart manually
-systemctl --user restart ev-collector
+# Restart
+systemctl --user restart ev-collector.service
 
 # Stop
-systemctl --user stop ev-collector
+systemctl --user stop ev-collector.service
 ```
 
----
+## CSV Schemas
 
-## CSV output
+Files are created in `~/hkust-ev-collector/`.
 
-Both files are created in `~/hkust-ev-collector/` on the server.
+### charging_sessions.csv
 
-**`charging_sessions.csv`**
-```
-timestamp_utc, charger_id, connector_id, status, session_start_utc, session_end_utc, source
-```
-
-**`charging_live.csv`**
-```
-timestamp_utc, charger_id, connector_id, current_A, voltage_V, source_endpoint
+```csv
+timestamp_utc,charger_id,connector_id,status,session_start_utc,session_end_utc,charger_status,charger_type,charger_point_model,charge_point_serial_number,charge_box_serial_number,is_enabled,boot_dttm_utc,last_status_dttm_utc,bay_no,connector_name,connector_type,connector_status,connector_status_last_updated_utc,connector_max_output_kw,connector_expected_end_utc,reservation_flag,rsr_status,rsr_id,tariff_max_charging_duration_mins,tariff_max_charging_unit,tariff_max_penalty_unit,tariff_gracing_period,tariff_gracing_period_unit,location_loc_id,location_address,location_station_code,location_contact_number,source
 ```
 
-Copy files back to your Windows machine:
+### charging_live.csv
+
+```csv
+timestamp_utc,charger_id,connector_id,current_A,voltage_V,power_kW,power_kW_est,energy_kWh,soc_pct,status,tran_start_utc,tran_stop_utc,last_update_utc,loc_id,source_endpoint
+```
+
+### charging_dashboard.csv
+
+```csv
+timestamp_utc,n_charging,n_available,n_unavailable,yesterday_kwh,yesterday_duration_s,today_kwh,today_duration_s,last7d_kwh,last7d_duration_s
+```
+
+## Export CSV to Local Machine
+
 ```powershell
 scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/charging_sessions.csv .
 scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/charging_live.csv .
+scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/charging_dashboard.csv .
+scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/collector_state.json .
 ```
-
----
-
-## Telemetry discovery
-
-The collector intercepts portal XHR/fetch responses and scans them for current/voltage fields.
-Until the internal API schema is confirmed, every candidate JSON endpoint and its top-level keys
-are logged at `INFO` level:
-
-```
-Telemetry candidate url=https://... keys=['chargerId', 'outputCurrent', 'outputVoltage', ...]
-```
-
-Check logs to identify the correct field names, then they are extracted automatically if they
-match any of the built-in key aliases in `collector.py → Config.current_keys / voltage_keys`.
-
----
 
 ## Troubleshooting
 
 | Symptom | Check |
 |---|---|
-| `Missing required environment variables` on start | `~/hkust-ev-collector/.env` is missing or incomplete |
-| Service not starting after push | `journalctl --user -u ev-collector -n 50` |
-| Playwright fails headless on Linux | Ensure `python -m playwright install-deps chromium` was run (needs sudo once) |
-| SSH push rejected | Confirm `~/.ssh/authorized_keys` on server contains your public key |
-| `charging_live.csv` has no rows | Check `Telemetry candidate` log lines to find the correct JSON field names |
+| `Missing required environment variables` on startup | Verify `~/hkust-ev-collector/.env` contains `API_KEY`, `PORTAL_USERNAME`, `PORTAL_PASSWORD` |
+| Service not starting after push | `journalctl --user -u ev-collector.service -n 100 --no-pager` |
+| No live rows in `charging_live.csv` | Check logs for `Portal auth attempt` or `Portal cycle failed` |
+| Duplicate session starts after restart | Ensure `collector_state.json` exists and is writable by service user |
+| SSH push rejected | Confirm public key exists in remote `~/.ssh/authorized_keys` |
