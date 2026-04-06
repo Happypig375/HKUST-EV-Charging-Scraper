@@ -62,15 +62,24 @@ if ($sshProbeExitCode -eq 0) {
 # Step 1.5: Install system packages required for venv/pip (python3-venv, python3-pip)
 # ---------------------------------------------------------------------------
 Write-Host "`n[Step 1.5] Ensuring python3-venv and python3-pip are installed on server..."
-$prevErrorActionPreference = $ErrorActionPreference
-$ErrorActionPreference = "Continue"
-& ssh @sshArgs $sshTarget "sudo -n apt-get install -y -qq python3-venv python3-pip 2>&1"
-$aptExitCode = $LASTEXITCODE
-$ErrorActionPreference = $prevErrorActionPreference
-if ($aptExitCode -ne 0) {
-    Write-Warning "apt-get install returned exit code $aptExitCode - continuing anyway."
+$prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+$pkgCount = & ssh @sshArgs $sshTarget "dpkg -l python3-venv python3-pip 2>/dev/null | grep -c '^ii'" 2>$null
+$ErrorActionPreference = $prevEAP
+if (($pkgCount -as [int]) -ge 2) {
+    Write-Host "  Already installed, skipping."
 } else {
-    Write-Host "  python3-venv and python3-pip installed (or already present)."
+    Write-Host "  Packages missing (python3-venv / python3-pip). Sudo required."
+    $sudoPassSec = Read-Host "  Sudo password for ${sshUser}@${sshHost}" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sudoPassSec)
+    try   { $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    & ssh @sshArgs $sshTarget "echo '$plain' | sudo -S apt-get install -y -qq python3-venv python3-pip 2>&1"
+    $aptCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
+    $plain = $null
+    if ($aptCode -ne 0) { Write-Warning "apt-get install returned exit code $aptCode - continuing." }
+    else { Write-Host "  python3-venv and python3-pip installed." }
 }
 
 # ---------------------------------------------------------------------------
