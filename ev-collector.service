@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/hkust-ev-collector
 EnvironmentFile=%h/hkust-ev-collector/.env
-ExecStart=/bin/bash %h/hkust-ev-collector/restarter.sh
+ExecStart=%h/hkust-ev-collector/.venv/bin/python %h/hkust-ev-collector/collector.py
 Restart=always
-RestartSec=5
+RestartSec=0
 StandardOutput=journal
 StandardError=journal
 

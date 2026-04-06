@@ -42,7 +42,6 @@ Collects HKUST EV charging data every 30 seconds from two APIs and writes append
 collector.py              Main async collector (dual-loop: third-party API + portal API)
 requirements.txt          Python dependencies
 .env.example              Template - copy to .env and fill secrets
-restarter.sh              Crash-restart wrapper called by systemd
 ev-collector.service      systemd user service unit
 deploy.conf.example       Server connection template (copy to deploy.conf, gitignored)
 scripts/
