@@ -70,7 +70,6 @@ class Config:
     api_base_url: str
     token_path: str
     charger_path: str
-    loc_id: str
     app_id: str
     api_key: str
     poll_interval_seconds: int
@@ -115,7 +114,6 @@ class Config:
             api_base_url="https://ust-ev.cstl.com.hk/portal/api/thirdparty/v1",
             token_path="/accesstoken",
             charger_path="/charger",
-            loc_id="54",
             app_id="ust-uat-app",
             api_key=secrets["API_KEY"],
             poll_interval_seconds=30,
@@ -609,7 +607,7 @@ class CollectorApp:
             cycle_started = now_utc_iso()
             try:
                 token = await self.token_manager.get_token()
-                url = f"{self.config.api_base_url}{self.config.charger_path}?locId={self.config.loc_id}"
+                url = f"{self.config.api_base_url}{self.config.charger_path}"
                 headers = {
                     "X-APP-ID": self.config.app_id,
                     "X-API-KEY": self.config.api_key,
