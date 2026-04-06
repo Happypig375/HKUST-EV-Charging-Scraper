@@ -87,6 +87,10 @@ class Config:
     discovery_log_keys: bool
     current_keys: list[str]
     voltage_keys: list[str]
+    power_keys: list[str]
+    energy_keys: list[str]
+    soc_keys: list[str]
+    status_keys: list[str]
     charger_id_keys: list[str]
     connector_id_keys: list[str]
     username_selectors: list[str]
@@ -128,6 +132,10 @@ class Config:
             discovery_log_keys=True,
             current_keys=["current", "currenta", "chargingcurrent", "amp", "amps", "outputcurrent"],
             voltage_keys=["voltage", "voltagev", "volt", "outputvoltage"],
+            power_keys=["power", "powerkw", "kw", "outputpower", "chargingpower"],
+            energy_keys=["energy", "energykwh", "kwh", "deliveredenergy", "chargedenergy"],
+            soc_keys=["soc", "stateofcharge", "batterypercent", "batterypercentage"],
+            status_keys=["status", "chargerstatus", "connectorstatus", "state", "chargingstatus"],
             charger_id_keys=["chargerid", "charger_id", "chargerno", "chargercode", "chargepointid", "cpid", "name", "id"],
             connector_id_keys=["connectorid", "connector_id", "connectorno", "connector"],
             username_selectors=["input[type='email']", "input[name='username']", "input[id*='user']"],
@@ -443,10 +451,17 @@ class PlaywrightTelemetryCollector:
             if isinstance(node, dict):
                 current = self._pick_number(node, self.config.current_keys)
                 voltage = self._pick_number(node, self.config.voltage_keys)
-                if current is not None or voltage is not None:
+                power = self._pick_number(node, self.config.power_keys)
+                energy = self._pick_number(node, self.config.energy_keys)
+                soc = self._pick_number(node, self.config.soc_keys)
+                status = self._pick_text(node, self.config.status_keys)
+                if current is not None or voltage is not None or power is not None or energy is not None or soc is not None:
                     charger_id = self._pick_identifier(node, self.config.charger_id_keys)
                     connector_id = self._pick_identifier(node, self.config.connector_id_keys) or charger_id
                     if charger_id:
+                        power_est = None
+                        if current is not None and voltage is not None:
+                            power_est = round((current * voltage) / 1000.0, 3)
                         records.append(
                             {
                                 "timestamp_utc": now_utc_iso(),
@@ -454,6 +469,11 @@ class PlaywrightTelemetryCollector:
                                 "connector_id": connector_id,
                                 "current_A": "" if current is None else current,
                                 "voltage_V": "" if voltage is None else voltage,
+                                "power_kW": "" if power is None else power,
+                                "power_kW_est": "" if power_est is None else power_est,
+                                "energy_kWh": "" if energy is None else energy,
+                                "soc_pct": "" if soc is None else soc,
+                                "status": "" if status is None else status,
                                 "source_endpoint": source_endpoint,
                             }
                         )
@@ -493,6 +513,17 @@ class PlaywrightTelemetryCollector:
                         return text
         return None
 
+    def _pick_text(self, node: dict[str, Any], candidates: list[str]) -> str | None:
+        normalized = {self._normalize_key(key): value for key, value in node.items()}
+        for candidate in candidates:
+            target = self._normalize_key(candidate)
+            for key, value in normalized.items():
+                if key == target and value is not None:
+                    text = str(value).strip()
+                    if text:
+                        return text
+        return None
+
 
 class CollectorApp:
     def __init__(self, config: Config, run_seconds: int | None = None):
@@ -513,6 +544,33 @@ class CollectorApp:
                 "status",
                 "session_start_utc",
                 "session_end_utc",
+                "charger_status",
+                "charger_type",
+                "charger_point_model",
+                "charge_point_serial_number",
+                "charge_box_serial_number",
+                "is_enabled",
+                "boot_dttm_utc",
+                "last_status_dttm_utc",
+                "bay_no",
+                "connector_name",
+                "connector_type",
+                "connector_status",
+                "connector_status_last_updated_utc",
+                "connector_max_output_kw",
+                "connector_expected_end_utc",
+                "reservation_flag",
+                "rsr_status",
+                "rsr_id",
+                "tariff_max_charging_duration_mins",
+                "tariff_max_charging_unit",
+                "tariff_max_penalty_unit",
+                "tariff_gracing_period",
+                "tariff_gracing_period_unit",
+                "location_loc_id",
+                "location_address",
+                "location_station_code",
+                "location_contact_number",
                 "source",
             ],
         )
@@ -524,6 +582,11 @@ class CollectorApp:
                 "connector_id",
                 "current_A",
                 "voltage_V",
+                "power_kW",
+                "power_kW_est",
+                "energy_kWh",
+                "soc_pct",
+                "status",
                 "source_endpoint",
             ],
         )
@@ -577,6 +640,33 @@ class CollectorApp:
                                 "status": transition["status"],
                                 "session_start_utc": transition["session_start"],
                                 "session_end_utc": transition["session_end"],
+                                "charger_status": row.get("charger_status"),
+                                "charger_type": row.get("charger_type"),
+                                "charger_point_model": row.get("charger_point_model"),
+                                "charge_point_serial_number": row.get("charge_point_serial_number"),
+                                "charge_box_serial_number": row.get("charge_box_serial_number"),
+                                "is_enabled": row.get("is_enabled"),
+                                "boot_dttm_utc": row.get("boot_dttm_utc"),
+                                "last_status_dttm_utc": row.get("last_status_dttm_utc"),
+                                "bay_no": row.get("bay_no"),
+                                "connector_name": row.get("connector_name"),
+                                "connector_type": row.get("connector_type"),
+                                "connector_status": row.get("connector_status"),
+                                "connector_status_last_updated_utc": row.get("connector_status_last_updated_utc"),
+                                "connector_max_output_kw": row.get("connector_max_output_kw"),
+                                "connector_expected_end_utc": row.get("connector_expected_end_utc"),
+                                "reservation_flag": row.get("reservation_flag"),
+                                "rsr_status": row.get("rsr_status"),
+                                "rsr_id": row.get("rsr_id"),
+                                "tariff_max_charging_duration_mins": row.get("tariff_max_charging_duration_mins"),
+                                "tariff_max_charging_unit": row.get("tariff_max_charging_unit"),
+                                "tariff_max_penalty_unit": row.get("tariff_max_penalty_unit"),
+                                "tariff_gracing_period": row.get("tariff_gracing_period"),
+                                "tariff_gracing_period_unit": row.get("tariff_gracing_period_unit"),
+                                "location_loc_id": row.get("location_loc_id"),
+                                "location_address": row.get("location_address"),
+                                "location_station_code": row.get("location_station_code"),
+                                "location_contact_number": row.get("location_contact_number"),
                                 "source": "thirdparty_charger_api",
                             }
                         )
@@ -614,33 +704,83 @@ class CollectorApp:
         except asyncio.TimeoutError:
             return
 
-    def _extract_charger_rows(self, payload: Any) -> list[dict[str, str | None]]:
-        records: list[dict[str, str | None]] = []
+    def _extract_charger_rows(self, payload: Any) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
 
-        def walk(node: Any) -> None:
-            if isinstance(node, dict):
-                charger_id = self._find_identifier(node, self.config.charger_id_keys)
-                status = self._find_status(node)
-                if charger_id and status:
-                    connector_id = self._find_identifier(node, self.config.connector_id_keys)
-                    current_tx = node.get("currentTransaction") if isinstance(node.get("currentTransaction"), dict) else {}
-                    session_start = parse_timestamp(current_tx.get("sessionStartDate"))
-                    records.append(
-                        {
-                            "charger_id": charger_id,
-                            "connector_id": connector_id,
-                            "status": str(status),
-                            "session_start": session_start,
-                        }
-                    )
-                for value in node.values():
-                    walk(value)
-            elif isinstance(node, list):
-                for item in node:
-                    walk(item)
+        charger_nodes = payload if isinstance(payload, list) else []
 
-        walk(payload)
-        dedup: dict[tuple[str, str], dict[str, str | None]] = {}
+        for charger in charger_nodes:
+            if not isinstance(charger, dict):
+                continue
+
+            charger_id = self._find_identifier(charger, self.config.charger_id_keys)
+            if not charger_id:
+                continue
+
+            cp_loc = charger.get("cpLoc") if isinstance(charger.get("cpLoc"), dict) else {}
+            current_tx = charger.get("currentTransaction") if isinstance(charger.get("currentTransaction"), dict) else {}
+            connectors = charger.get("connectors") if isinstance(charger.get("connectors"), list) else []
+
+            connector_nodes = [c for c in connectors if isinstance(c, dict)]
+            if not connector_nodes:
+                connector_nodes = [{}]
+
+            for connector in connector_nodes:
+                tariff = connector.get("tariff") if isinstance(connector.get("tariff"), dict) else {}
+
+                connector_id = None
+                if connector:
+                    connector_id = self._find_identifier(connector, self.config.connector_id_keys)
+                    if connector_id is None and connector.get("connectorId") is not None:
+                        connector_id = str(connector.get("connectorId")).strip() or None
+
+                status = connector.get("status") or charger.get("status") or charger.get("chargerStatus")
+                if not status:
+                    continue
+
+                session_start = parse_timestamp(
+                    current_tx.get("sessionStartDate")
+                    or current_tx.get("startDate")
+                    or current_tx.get("startDateTime")
+                )
+
+                records.append(
+                    {
+                        "charger_id": charger_id,
+                        "connector_id": connector_id,
+                        "status": str(status),
+                        "session_start": session_start,
+                        "charger_status": charger.get("chargerStatus") or charger.get("status"),
+                        "charger_type": charger.get("chargerType"),
+                        "charger_point_model": charger.get("chargerPointModel"),
+                        "charge_point_serial_number": charger.get("chargePointSerialNumber"),
+                        "charge_box_serial_number": charger.get("chargeBoxSerialNumber"),
+                        "is_enabled": charger.get("isEnabled"),
+                        "boot_dttm_utc": parse_timestamp(charger.get("bootDttm")),
+                        "last_status_dttm_utc": parse_timestamp(charger.get("lastStatusDttm")),
+                        "bay_no": charger.get("bayNo"),
+                        "connector_name": connector.get("name"),
+                        "connector_type": connector.get("type"),
+                        "connector_status": connector.get("status"),
+                        "connector_status_last_updated_utc": parse_timestamp(connector.get("statusLastUpdatedDt")),
+                        "connector_max_output_kw": connector.get("connectorMaxOutputKw"),
+                        "connector_expected_end_utc": parse_timestamp(connector.get("connectorExpectedChargingEndTimeWithBuffer")),
+                        "reservation_flag": connector.get("reservationFlag"),
+                        "rsr_status": connector.get("rsrStatus"),
+                        "rsr_id": connector.get("rsrId"),
+                        "tariff_max_charging_duration_mins": tariff.get("maxChargingDurationMins"),
+                        "tariff_max_charging_unit": tariff.get("maxChargingUnit"),
+                        "tariff_max_penalty_unit": tariff.get("maxPenaltyUnit"),
+                        "tariff_gracing_period": tariff.get("gracingPeriod"),
+                        "tariff_gracing_period_unit": tariff.get("gracingPeriodUnit"),
+                        "location_loc_id": cp_loc.get("locId"),
+                        "location_address": cp_loc.get("address"),
+                        "location_station_code": cp_loc.get("stationCode"),
+                        "location_contact_number": cp_loc.get("contactNumber"),
+                    }
+                )
+
+        dedup: dict[tuple[str, str], dict[str, Any]] = {}
         for item in records:
             charger_id = str(item["charger_id"])
             connector_id = str(item["connector_id"] or charger_id)
