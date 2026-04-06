@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import re
 import signal
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -63,6 +64,80 @@ def parse_timestamp(value: Any) -> str | None:
         except ValueError:
             continue
     return None
+
+
+# Canonical Carpark ID mapping (Existing -> New) from the mapping spreadsheet.
+CARPARK_ID_MAP: dict[str, str] = {
+    "LG2-125": "LG2-11",
+    "LG2-126": "LG2-09",
+    "LG2-127": "LG2-07",
+    "LG5-36": "LG5-10",
+    "LG5-37": "LG5-09",
+    "LG5-38": "LG5-08",
+    "LG5-39": "LG5-07",
+    "LG5-40": "LG5-06",
+    "LG5-41": "LG5-05",
+    "LG5-42": "LG5-04",
+    "LG5-43": "LG5-03",
+    "LG5-44": "LG5-02",
+    "LG5-45": "LG5-01",
+    "LG5-46": "LG5-13",
+    "LG5-47": "LG5-14",
+    "LG5-48": "LG5-15",
+    "LG5-49": "LG5-16",
+    "LG5-50": "LG5-17",
+    "LG5-51": "LG5-18",
+    "LG5-52": "LG5-19",
+    "LG5-53": "LG5-20",
+    "LG5-54": "LG5-30",
+    "LG5-55": "LG5-29",
+    "LG5-56": "LG5-28",
+    "LG5-57": "LG5-27",
+    "LG5-58": "LG5-26",
+    "LG6-01": "LG6-08",
+    "LG6-02": "LG6-07",
+    "LG6-03": "LG6-06",
+    "LG6-04": "LG6-05",
+    "LG6-05": "LG6-04",
+    "LG6-06": "LG6-03",
+    "LG6-07": "LG6-02",
+    "LG6-08": "LG6-01",
+    "LG6-09": "LG6-10",
+    "LG6-10": "LG6-11",
+    "LG6-11": "LG6-12",
+    "LG6-12": "LG6-13",
+    "LG6-13": "LG6-14",
+    "LG6-14": "LG6-15",
+    "LG6-15": "LG6-16",
+    "LG6-16": "LG6-17",
+    "LG6-17": "LG6-25",
+    "LG6-18": "LG6-24",
+    "LG6-19": "LG6-23",
+    "LG6-20": "LG6-22",
+    "LG6-21": "LG6-21",
+    "LG6-22": "LG6-20",
+    "LG6-23": "LG6-19",
+}
+
+
+def normalize_charger_id(value: Any) -> str:
+    """Normalize charger IDs so cross-source joins are stable.
+
+    Steps:
+    1) Canonicalize case/spacing.
+    2) Zero-pad LG5/LG6 numeric suffix to 2 digits.
+    3) Apply explicit Carpark Existing->New mapping from `CARPARK_ID_MAP`.
+    """
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+
+    match = re.fullmatch(r"(LG[56])-(\d+)", text)
+    if match:
+        prefix, number = match.groups()
+        text = f"{prefix}-{int(number):02d}"
+
+    return CARPARK_ID_MAP.get(text, text)
 
 
 @dataclass
@@ -262,7 +337,16 @@ class SessionTracker:
         self._state_file = Path(state_file) if state_file else None
         if self._state_file and self._state_file.exists():
             try:
-                self._state = json.loads(self._state_file.read_text(encoding="utf-8"))
+                loaded = json.loads(self._state_file.read_text(encoding="utf-8"))
+                # Migrate legacy keys to normalized charger IDs on startup.
+                migrated: dict[str, dict[str, str | None]] = {}
+                for key, value in loaded.items():
+                    if not isinstance(key, str) or "::" not in key:
+                        continue
+                    charger_id, connector_id = key.split("::", 1)
+                    normalized = normalize_charger_id(charger_id)
+                    migrated[self.make_key(normalized, connector_id)] = value
+                self._state = migrated
             except Exception:
                 self._state = {}
 
@@ -381,6 +465,7 @@ class CollectorApp:
             [
                 "timestamp_utc",
                 "charger_id",
+                "canonical_charger_id",
                 "connector_id",
                 "status",
                 "session_start_utc",
@@ -420,6 +505,7 @@ class CollectorApp:
             [
                 "timestamp_utc",
                 "charger_id",
+                "canonical_charger_id",
                 "connector_id",
                 "current_A",
                 "voltage_V",
@@ -486,7 +572,7 @@ class CollectorApp:
                 self.logger.info("Fetched charger snapshot rows=%s", len(rows))
                 for row in rows:
                     transition = self.session_tracker.transition(
-                        charger_id=row["charger_id"],
+                        charger_id=row["canonical_charger_id"],
                         connector_id=row["connector_id"],
                         status=row["status"],
                         transaction_start=row["session_start"],
@@ -497,6 +583,7 @@ class CollectorApp:
                             {
                                 "timestamp_utc": cycle_started,
                                 "charger_id": row["charger_id"],
+                                "canonical_charger_id": row["canonical_charger_id"],
                                 "connector_id": row["connector_id"] or row["charger_id"],
                                 "status": transition["status"],
                                 "session_start_utc": transition["session_start"],
@@ -545,6 +632,8 @@ class CollectorApp:
                 data = await self.portal_collector.fetch_quickinfo()
                 connectors = data.get("cpQuickInfoDTOS") or []
                 for entry in connectors:
+                    raw_charger_id = entry.get("cpNo") or ""
+                    canonical_charger_id = normalize_charger_id(raw_charger_id)
                     voltages = entry.get("voltages") or []
                     currents = entry.get("currents") or []
                     voltage = voltages[0] if voltages else None
@@ -556,7 +645,8 @@ class CollectorApp:
                     await self.live_writer.append_row(
                         {
                             "timestamp_utc": ts,
-                            "charger_id": entry.get("cpNo") or "",
+                            "charger_id": raw_charger_id,
+                            "canonical_charger_id": canonical_charger_id,
                             "connector_id": entry.get("connectorId") or "",
                             "current_A": "" if current is None else current,
                             "voltage_V": "" if voltage is None else voltage,
@@ -620,6 +710,7 @@ class CollectorApp:
             charger_id = self._find_identifier(charger, self.config.charger_id_keys)
             if not charger_id:
                 continue
+            canonical_charger_id = normalize_charger_id(charger_id)
 
             cp_loc = charger.get("cpLoc") if isinstance(charger.get("cpLoc"), dict) else {}
             current_tx = charger.get("currentTransaction") if isinstance(charger.get("currentTransaction"), dict) else {}
@@ -651,6 +742,7 @@ class CollectorApp:
                 records.append(
                     {
                         "charger_id": charger_id,
+                        "canonical_charger_id": canonical_charger_id,
                         "connector_id": connector_id,
                         "status": str(status),
                         "session_start": session_start,
@@ -686,8 +778,8 @@ class CollectorApp:
 
         dedup: dict[tuple[str, str], dict[str, Any]] = {}
         for item in records:
-            charger_id = str(item["charger_id"])
-            connector_id = str(item["connector_id"] or charger_id)
+            charger_id = str(item["canonical_charger_id"])
+            connector_id = str(item["connector_id"] or item["charger_id"])
             dedup[(charger_id, connector_id)] = item
         return list(dedup.values())
 
