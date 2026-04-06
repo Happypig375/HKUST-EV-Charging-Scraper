@@ -59,6 +59,21 @@ if ($sshProbeExitCode -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
+# Step 1.5: Install system packages required for venv/pip (python3-venv, python3-pip)
+# ---------------------------------------------------------------------------
+Write-Host "`n[Step 1.5] Ensuring python3-venv and python3-pip are installed on server..."
+$prevErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& ssh @sshArgs $sshTarget "sudo -n apt-get install -y -qq python3-venv python3-pip 2>&1"
+$aptExitCode = $LASTEXITCODE
+$ErrorActionPreference = $prevErrorActionPreference
+if ($aptExitCode -ne 0) {
+    Write-Warning "apt-get install returned exit code $aptExitCode - continuing anyway."
+} else {
+    Write-Host "  python3-venv and python3-pip installed (or already present)."
+}
+
+# ---------------------------------------------------------------------------
 # Step 2: Initialise server (bare repo + hook + linger)
 # ---------------------------------------------------------------------------
 Write-Host "`n[Step 2] Initialising server bare repo and hook..."
@@ -136,8 +151,16 @@ try {
         git branch -M $branch
     }
 
+    $prevErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     git push -u origin $branch
-    Write-Host "  Pushed branch '$branch' to origin."
+    $pushExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevErrorActionPreference
+    if ($pushExitCode -ne 0) {
+        Write-Warning "git push exited $pushExitCode - hook errors shown above, but ref was updated."
+    } else {
+        Write-Host "  Pushed branch '$branch' to origin."
+    }
 } finally {
     Pop-Location
 }
