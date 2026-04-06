@@ -1,0 +1,17 @@
+[Unit]
+Description=HKUST EV Charging Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hkust-ev-collector
+EnvironmentFile=%h/hkust-ev-collector/.env
+ExecStart=/bin/bash %h/hkust-ev-collector/restarter.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

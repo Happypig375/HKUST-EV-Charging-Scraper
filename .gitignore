@@ -1,0 +1,12 @@
+deploy.conf
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+logs/
+.playwright-profile/
+charging_sessions.csv
+charging_live.csv

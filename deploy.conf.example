@@ -1,0 +1,7 @@
+# Remote server connection settings.
+# Copy this file to deploy.conf and fill in real values.
+# deploy.conf is gitignored and must never be committed.
+SERVER_HOST=
+SERVER_PORT=22
+SERVER_USER=
+SERVER_BAREREPO=/home/user/hkust-ev-collector.git
