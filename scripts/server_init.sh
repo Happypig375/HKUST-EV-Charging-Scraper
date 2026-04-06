@@ -35,8 +35,9 @@ git --work-tree="$WORK_TREE" --git-dir="$BARE_REPO" checkout -f
 cd "$WORK_TREE"
 
 echo "--- Installing Python dependencies"
-if [[ ! -d .venv ]]; then
-  python3 -m venv .venv
+if [[ ! -f .venv/bin/activate ]]; then
+  rm -rf .venv
+  python3 -m venv .venv || { echo "ERROR: python3 -m venv failed" >&2; exit 1; }
 fi
 source .venv/bin/activate
 pip install --upgrade pip -q
