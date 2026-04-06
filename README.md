@@ -50,6 +50,35 @@ scripts/
   server_init.sh          One-time server setup: bare repo + post-receive hook
   bootstrap_server.sh     Manual fallback bootstrap
   update_and_restart.sh   Manual update fallback
+  _portal_probe.py        Endpoint discovery probe for portal API (diagnostic)
+  _quickinfo_probe.py     quickInfo shape/field probe (diagnostic)
+```
+
+## Diagnostic Probes
+
+Two probe scripts are intentionally kept in the repo as diagnostics:
+
+- `scripts/_portal_probe.py`
+  - Tries likely endpoint paths under `/portal/api/api`.
+  - Prints HTTP status and sampled JSON path shapes.
+  - Use this when endpoints move, are versioned, or access control changes.
+
+- `scripts/_quickinfo_probe.py`
+  - Authenticates and fetches `/v2/quickInfo`.
+  - Prints connector count, key set, charging subset, and sample records.
+  - Use this to detect payload shape drift before changing `collector.py` extractors.
+
+Rationale:
+- The production collector uses direct API polling (no browser automation).
+- These probes provide a fast, repeatable way to rediscover endpoint and schema changes.
+- Keeping them in git preserves operational knowledge and speeds incident response.
+
+Example usage on CEZ083:
+
+```bash
+cd ~/hkust-ev-collector
+python3 scripts/_portal_probe.py
+python3 scripts/_quickinfo_probe.py
 ```
 
 ## Quick Start
@@ -167,3 +196,4 @@ scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/collector_
 | No live rows in `charging_live.csv` | Check logs for `Portal auth attempt` or `Portal cycle failed` |
 | Duplicate session starts after restart | Ensure `collector_state.json` exists and is writable by service user |
 | SSH push rejected | Confirm public key exists in remote `~/.ssh/authorized_keys` |
+| API changed unexpectedly | Run `scripts/_portal_probe.py` and `scripts/_quickinfo_probe.py` to remap endpoints and fields |
