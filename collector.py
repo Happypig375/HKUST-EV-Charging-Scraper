@@ -257,8 +257,21 @@ class TokenManager:
 
 
 class SessionTracker:
-    def __init__(self):
+    def __init__(self, state_file: str | None = None):
         self._state: dict[str, dict[str, str | None]] = {}
+        self._state_file = Path(state_file) if state_file else None
+        if self._state_file and self._state_file.exists():
+            try:
+                self._state = json.loads(self._state_file.read_text(encoding="utf-8"))
+            except Exception:
+                self._state = {}
+
+    def _save(self) -> None:
+        if not self._state_file:
+            return
+        tmp = self._state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._state), encoding="utf-8")
+        tmp.replace(self._state_file)
 
     @staticmethod
     def make_key(charger_id: str, connector_id: str | None) -> str:
@@ -278,29 +291,24 @@ class SessionTracker:
         prev_status = (previous.get("status") or "").lower()
         current_status = (status or "").lower()
 
+        result: dict[str, str] | None = None
+
         if current_status == "charging" and prev_status != "charging":
             start_time = transaction_start or detected_at
             self._state[key] = {"status": status, "session_start": start_time}
-            return {
-                "status": status,
-                "session_start": start_time,
-                "session_end": "",
-            }
-
-        if current_status != "charging" and prev_status == "charging":
+            result = {"status": status, "session_start": start_time, "session_end": ""}
+        elif current_status != "charging" and prev_status == "charging":
             session_start = previous.get("session_start") or detected_at
             self._state[key] = {"status": status, "session_start": None}
-            return {
+            result = {"status": status, "session_start": session_start, "session_end": detected_at}
+        else:
+            self._state[key] = {
                 "status": status,
-                "session_start": session_start,
-                "session_end": detected_at,
+                "session_start": previous.get("session_start") if current_status == "charging" else None,
             }
 
-        self._state[key] = {
-            "status": status,
-            "session_start": previous.get("session_start") if current_status == "charging" else None,
-        }
-        return None
+        self._save()
+        return result
 
 
 class PortalApiCollector:
@@ -365,7 +373,7 @@ class CollectorApp:
         self.logger = setup_logging(config)
         self.stop_event = asyncio.Event()
         self.portal_collector: PortalApiCollector | None = None
-        self.session_tracker = SessionTracker()
+        self.session_tracker = SessionTracker(state_file="collector_state.json")
         self.http: aiohttp.ClientSession | None = None
         self.token_manager: TokenManager | None = None
         self.sessions_writer = CsvWriter(
