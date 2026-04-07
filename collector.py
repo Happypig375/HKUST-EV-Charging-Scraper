@@ -75,6 +75,8 @@ class Config:
     api_base_url: str
     token_path: str
     charger_path: str
+    transaction_path: str
+    transaction_lookback_days: int
     app_id: str
     api_key: str
     poll_interval_seconds: int
@@ -107,6 +109,8 @@ class Config:
             api_base_url="https://ust-ev.cstl.com.hk/portal/api/thirdparty/v1",
             token_path="/accesstoken",
             charger_path="/charger",
+            transaction_path="/transaction",
+            transaction_lookback_days=7,
             app_id="ust-uat-app",
             api_key=secrets["API_KEY"],
             poll_interval_seconds=30,
@@ -400,6 +404,17 @@ class CollectorApp:
                 "status",
                 "session_start_utc",
                 "session_end_utc",
+                "transaction_id",
+                "transaction_status",
+                "transaction_create_utc",
+                "transaction_end_utc",
+                "meter_start",
+                "meter_stop",
+                "power_consumed",
+                "id_tag",
+                "account_id",
+                "soc_start",
+                "soc_stop",
                 "charger_status",
                 "charger_type",
                 "charger_point_model",
@@ -501,13 +516,27 @@ class CollectorApp:
                         raise RuntimeError(f"Charger list status={response.status}")
 
                 rows = self._extract_charger_rows(payload)
+                tx_index = await self._fetch_transaction_index()
                 self.logger.info("Fetched charger snapshot rows=%s", len(rows))
                 for row in rows:
+                    tx_key = self._make_connector_key(row["charger_id"], row["connector_id"])
+                    tx = tx_index.get(tx_key, {})
+                    row["transaction_id"] = tx.get("transaction_id")
+                    row["transaction_status"] = tx.get("transaction_status")
+                    row["transaction_create_utc"] = tx.get("transaction_create_utc")
+                    row["transaction_end_utc"] = tx.get("transaction_end_utc")
+                    row["meter_start"] = tx.get("meter_start")
+                    row["meter_stop"] = tx.get("meter_stop")
+                    row["power_consumed"] = tx.get("power_consumed")
+                    row["id_tag"] = tx.get("id_tag")
+                    row["account_id"] = tx.get("account_id")
+                    row["soc_start"] = tx.get("soc_start")
+                    row["soc_stop"] = tx.get("soc_stop")
                     transition = self.session_tracker.transition(
                         charger_id=row["canonical_charger_id"],
                         connector_id=row["connector_id"],
                         status=row["status"],
-                        transaction_start=row["session_start"],
+                        transaction_start=row["session_start"] or row.get("transaction_create_utc"),
                         detected_at=cycle_started,
                     )
                     if transition:
@@ -520,6 +549,17 @@ class CollectorApp:
                                 "status": transition["status"],
                                 "session_start_utc": transition["session_start"],
                                 "session_end_utc": transition["session_end"],
+                                "transaction_id": row.get("transaction_id"),
+                                "transaction_status": row.get("transaction_status"),
+                                "transaction_create_utc": row.get("transaction_create_utc"),
+                                "transaction_end_utc": row.get("transaction_end_utc"),
+                                "meter_start": row.get("meter_start"),
+                                "meter_stop": row.get("meter_stop"),
+                                "power_consumed": row.get("power_consumed"),
+                                "id_tag": row.get("id_tag"),
+                                "account_id": row.get("account_id"),
+                                "soc_start": row.get("soc_start"),
+                                "soc_stop": row.get("soc_stop"),
                                 "charger_status": row.get("charger_status"),
                                 "charger_type": row.get("charger_type"),
                                 "charger_point_model": row.get("charger_point_model"),
@@ -674,6 +714,74 @@ class CollectorApp:
             await asyncio.wait_for(self.stop_event.wait(), timeout=self.config.poll_interval_seconds)
         except asyncio.TimeoutError:
             return
+
+    @staticmethod
+    def _make_connector_key(charger_id: str, connector_id: str | None) -> tuple[str, str]:
+        connector = str(connector_id or charger_id)
+        return str(charger_id), connector
+
+    async def _fetch_transaction_index(self) -> dict[tuple[str, str], dict[str, Any]]:
+        assert self.http is not None
+        assert self.token_manager is not None
+
+        token = await self.token_manager.get_token()
+        end_date = datetime.now(tz=UTC).date()
+        start_date = end_date - timedelta(days=self.config.transaction_lookback_days)
+        url = f"{self.config.api_base_url}{self.config.transaction_path}"
+        headers = {
+            "X-APP-ID": self.config.app_id,
+            "X-API-KEY": self.config.api_key,
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        params = {
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+        }
+
+        index: dict[tuple[str, str], dict[str, Any]] = {}
+        try:
+            async with self.http.get(url, headers=headers, params=params) as response:
+                payload = await response.json(content_type=None)
+                if response.status >= 400:
+                    raise RuntimeError(f"Transaction list status={response.status}")
+
+            records = payload if isinstance(payload, list) else payload.get("response", []) if isinstance(payload, dict) else []
+            if not isinstance(records, list):
+                return index
+
+            for tx in records:
+                if not isinstance(tx, dict):
+                    continue
+                charger_id = str(tx.get("chargerId") or "").strip()
+                connector_id = str(tx.get("connectorId") or "").strip()
+                if not charger_id:
+                    continue
+
+                key = self._make_connector_key(charger_id, connector_id)
+                create_utc = parse_timestamp(tx.get("createDttm"))
+                prev = index.get(key)
+                prev_create = prev.get("transaction_create_utc") if prev else None
+                if prev_create and create_utc and create_utc <= prev_create:
+                    continue
+
+                index[key] = {
+                    "transaction_id": tx.get("tranId"),
+                    "transaction_status": tx.get("status"),
+                    "transaction_create_utc": create_utc,
+                    "transaction_end_utc": parse_timestamp(tx.get("endDttm")),
+                    "meter_start": tx.get("meterStart"),
+                    "meter_stop": tx.get("meterStop"),
+                    "power_consumed": tx.get("powerConsumed"),
+                    "id_tag": tx.get("idTag"),
+                    "account_id": tx.get("accountId"),
+                    "soc_start": tx.get("socStart"),
+                    "soc_stop": tx.get("socStop"),
+                }
+        except Exception as exc:
+            self.logger.warning("Transaction fetch failed: %s", exc)
+
+        return index
 
     def _extract_charger_rows(self, payload: Any) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
