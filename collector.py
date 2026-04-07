@@ -466,6 +466,8 @@ class CollectorApp:
                 "last7d_duration_s",
             ],
         )
+        self._last_live_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_dashboard_row: dict[str, Any] | None = None
 
     async def _init_http(self) -> None:
         timeout = aiohttp.ClientTimeout(total=self.config.http_timeout_seconds)
@@ -561,6 +563,7 @@ class CollectorApp:
             try:
                 data = await self.portal_collector.fetch_quickinfo()
                 connectors = data.get("cpQuickInfoDTOS") or []
+                live_appended = 0
                 for entry in connectors:
                     raw_charger_id = entry.get("cpNo") or ""
                     canonical_charger_id = normalize_charger_id(raw_charger_id)
@@ -572,50 +575,94 @@ class CollectorApp:
                     power_est = None
                     if current is not None and voltage is not None:
                         power_est = round(current * voltage / 1000.0, 3)
-                    await self.live_writer.append_row(
-                        {
-                            "timestamp_utc": ts,
-                            "charger_id": raw_charger_id,
-                            "canonical_charger_id": canonical_charger_id,
-                            "connector_id": entry.get("connectorId") or "",
-                            "current_A": "" if current is None else current,
-                            "voltage_V": "" if voltage is None else voltage,
-                            "power_kW": "" if power is None else power,
-                            "power_kW_est": "" if power_est is None else power_est,
-                            "energy_kWh": "" if entry.get("kwh") is None else entry.get("kwh"),
-                            "soc_pct": "" if entry.get("soc") is None else entry.get("soc"),
-                            "status": entry.get("connectorStatus") or "",
-                            "tran_start_utc": parse_timestamp(entry.get("tranStartDate")) or "",
-                            "tran_stop_utc": parse_timestamp(entry.get("tranStopDate")) or "",
-                            "last_update_utc": parse_timestamp(entry.get("lastStatusUpdateDate")) or "",
-                            "loc_id": entry.get("locId") if entry.get("locId") is not None else "",
-                            "source_endpoint": "/v2/quickInfo",
-                        }
-                    )
+                    connector_id = entry.get("connectorId") or ""
+                    live_row = {
+                        "timestamp_utc": ts,
+                        "charger_id": raw_charger_id,
+                        "canonical_charger_id": canonical_charger_id,
+                        "connector_id": connector_id,
+                        "current_A": "" if current is None else current,
+                        "voltage_V": "" if voltage is None else voltage,
+                        "power_kW": "" if power is None else power,
+                        "power_kW_est": "" if power_est is None else power_est,
+                        "energy_kWh": "" if entry.get("kwh") is None else entry.get("kwh"),
+                        "soc_pct": "" if entry.get("soc") is None else entry.get("soc"),
+                        "status": entry.get("connectorStatus") or "",
+                        "tran_start_utc": parse_timestamp(entry.get("tranStartDate")) or "",
+                        "tran_stop_utc": parse_timestamp(entry.get("tranStopDate")) or "",
+                        "last_update_utc": parse_timestamp(entry.get("lastStatusUpdateDate")) or "",
+                        "loc_id": entry.get("locId") if entry.get("locId") is not None else "",
+                        "source_endpoint": "/v2/quickInfo",
+                    }
+                    live_key = (str(raw_charger_id), str(connector_id))
+                    previous_live = self._last_live_rows.get(live_key)
+                    if self._rows_changed(
+                        previous_live,
+                        live_row,
+                        [
+                            "charger_id",
+                            "canonical_charger_id",
+                            "connector_id",
+                            "current_A",
+                            "voltage_V",
+                            "power_kW",
+                            "power_kW_est",
+                            "energy_kWh",
+                            "soc_pct",
+                            "status",
+                            "tran_start_utc",
+                            "tran_stop_utc",
+                            "last_update_utc",
+                            "loc_id",
+                            "source_endpoint",
+                        ],
+                    ):
+                        await self.live_writer.append_row(live_row)
+                        self._last_live_rows[live_key] = live_row
+                        live_appended += 1
 
                 usage = data.get("cpUsage") or {}
                 summary = data.get("cpSummaryByDayRangeQuickInfoDTO") or {}
                 yesterday = summary.get("yesterdaySummary") or {}
                 today_s = summary.get("todaySummary") or {}
                 last7d = summary.get("last7daysSummary") or {}
-                await self.dashboard_writer.append_row(
-                    {
-                        "timestamp_utc": ts,
-                        "n_charging": usage.get("noOfChargingConnectors") if usage.get("noOfChargingConnectors") is not None else "",
-                        "n_available": usage.get("noOfAvailableConnectors") if usage.get("noOfAvailableConnectors") is not None else "",
-                        "n_unavailable": usage.get("noOfUnAvailableConnectors") if usage.get("noOfUnAvailableConnectors") is not None else "",
-                        "yesterday_kwh": yesterday.get("kwh") if yesterday.get("kwh") is not None else "",
-                        "yesterday_duration_s": yesterday.get("duration") if yesterday.get("duration") is not None else "",
-                        "today_kwh": today_s.get("kwh") if today_s.get("kwh") is not None else "",
-                        "today_duration_s": today_s.get("duration") if today_s.get("duration") is not None else "",
-                        "last7d_kwh": last7d.get("kwh") if last7d.get("kwh") is not None else "",
-                        "last7d_duration_s": last7d.get("duration") if last7d.get("duration") is not None else "",
-                    }
-                )
+                dashboard_row = {
+                    "timestamp_utc": ts,
+                    "n_charging": usage.get("noOfChargingConnectors") if usage.get("noOfChargingConnectors") is not None else "",
+                    "n_available": usage.get("noOfAvailableConnectors") if usage.get("noOfAvailableConnectors") is not None else "",
+                    "n_unavailable": usage.get("noOfUnAvailableConnectors") if usage.get("noOfUnAvailableConnectors") is not None else "",
+                    "yesterday_kwh": yesterday.get("kwh") if yesterday.get("kwh") is not None else "",
+                    "yesterday_duration_s": yesterday.get("duration") if yesterday.get("duration") is not None else "",
+                    "today_kwh": today_s.get("kwh") if today_s.get("kwh") is not None else "",
+                    "today_duration_s": today_s.get("duration") if today_s.get("duration") is not None else "",
+                    "last7d_kwh": last7d.get("kwh") if last7d.get("kwh") is not None else "",
+                    "last7d_duration_s": last7d.get("duration") if last7d.get("duration") is not None else "",
+                }
+                dashboard_appended = 0
+                if self._rows_changed(
+                    self._last_dashboard_row,
+                    dashboard_row,
+                    [
+                        "n_charging",
+                        "n_available",
+                        "n_unavailable",
+                        "yesterday_kwh",
+                        "yesterday_duration_s",
+                        "today_kwh",
+                        "today_duration_s",
+                        "last7d_kwh",
+                        "last7d_duration_s",
+                    ],
+                ):
+                    await self.dashboard_writer.append_row(dashboard_row)
+                    self._last_dashboard_row = dashboard_row
+                    dashboard_appended = 1
                 self.logger.info(
-                    "Portal snapshot: connectors=%s charging=%s",
+                    "Portal snapshot: connectors=%s charging=%s live_appended=%s dashboard_appended=%s",
                     len(connectors),
                     usage.get("noOfChargingConnectors"),
+                    live_appended,
+                    dashboard_appended,
                 )
             except Exception as exc:
                 self.logger.warning("Portal cycle failed: %s", exc)
@@ -712,6 +759,15 @@ class CollectorApp:
             connector_id = str(item["connector_id"] or item["charger_id"])
             dedup[(charger_id, connector_id)] = item
         return list(dedup.values())
+
+    @staticmethod
+    def _rows_changed(previous: dict[str, Any] | None, current: dict[str, Any], keys: list[str]) -> bool:
+        if previous is None:
+            return True
+        for key in keys:
+            if str(previous.get(key, "")) != str(current.get(key, "")):
+                return True
+        return False
 
     @staticmethod
     def _normalize_key(key: str) -> str:
