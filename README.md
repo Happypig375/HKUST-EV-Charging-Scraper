@@ -186,6 +186,59 @@ scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/charging_d
 scp -P <server_port> <server_user>@<server_host>:~/hkust-ev-collector/collector_state.json .
 ```
 
+## Compressed Export (Best Compression) + Download
+
+Compress all three CSVs on the server with `xz -9e` (maximum ratio) and download one archive:
+
+```powershell
+function Get-CompressedChargingCsv {
+  param(
+    [int]$ServerPort,
+    [string]$ServerUser,
+    [string]$ServerHost
+  )
+
+  $archive = ssh -p $ServerPort "$ServerUser@$ServerHost" 'cd ~/hkust-ev-collector; ARCHIVE="charging_csvs_$(date +%Y%m%d_%H%M%S).tar.xz"; tar -cf - charging_sessions.csv charging_live.csv charging_dashboard.csv | xz -9e -T0 > "$ARCHIVE"; printf "%s" "$ARCHIVE"'
+  scp -P $ServerPort "$ServerUser@$ServerHost`:~/hkust-ev-collector/$archive" .
+}
+
+Get-CompressedChargingCsv -ServerPort 22 -ServerUser "<server_user>" -ServerHost "<server_host>"
+```
+
+## Python: Extract and Load to `dfs`
+
+Given an archive downloaded by the command above, this loads dataframes compatible with your existing object shape.
+
+```python
+import tarfile
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+
+extract_dir = Path(".")
+
+archives = sorted(extract_dir.glob("*.tar.xz"))
+if len(archives) != 1:
+  raise RuntimeError(
+    f"Expected exactly 1 .tar.xz file in {extract_dir.resolve()}, found {len(archives)}"
+  )
+archive = archives[0]
+
+# Extract the three CSVs into extract_dir.
+with tarfile.open(archive, mode="r:xz") as tf:
+    tf.extractall(path=extract_dir)
+
+paths = {
+    "sessions": extract_dir / "charging_sessions.csv",
+    "live": extract_dir / "charging_live.csv",
+    "dashboard": extract_dir / "charging_dashboard.csv",
+}
+
+dfs = {name: pd.read_csv(path) for name, path in paths.items()}
+{name: df.shape for name, df in dfs.items()}
+```
+
 ## Troubleshooting
 
 | Symptom | Check |
